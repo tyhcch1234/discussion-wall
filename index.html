@@ -497,13 +497,14 @@ function makeCloudStore(bucket) {
   return {
     mode: 'cloud',
     async listKeys(prefix) {
-      const r = await req(base + '/?prefix=' + encodeURIComponent(prefix) + '&limit=1000');
+      // cache-buster：避免 CDN 邊緣快取回舊清單
+      const r = await req(base + '/?prefix=' + encodeURIComponent(prefix) + '&limit=1000&_=' + Date.now());
       if (!r.ok) throw new Error('list ' + r.status);
       const txt = await r.text();
       return txt.split('\n').map((s) => s.trim()).filter(Boolean);
     },
     async get(key) {
-      const r = await req(base + '/' + encodeURIComponent(key));
+      const r = await req(base + '/' + encodeURIComponent(key) + '?_=' + Date.now());
       if (r.status === 404) return null;
       if (!r.ok) throw new Error('get ' + r.status);
       const txt = await r.text();
