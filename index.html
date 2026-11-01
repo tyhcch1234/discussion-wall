@@ -466,6 +466,20 @@
   </div>
 </div>
 
+<div class="modal-back" id="passChangeModal">
+  <div class="modal">
+    <h3>更改管理密碼</h3>
+    <p class="hint">改完之後，所有裝置（包括其他老師）都要用新密碼登入。</p>
+    <input class="field" id="curPass" type="password" placeholder="目前密碼" autocomplete="current-password">
+    <input class="field" id="newPass" type="password" placeholder="新密碼（最少 4 個字元）" style="margin-top:9px" autocomplete="new-password">
+    <input class="field" id="newPass2" type="password" placeholder="再次輸入新密碼" style="margin-top:9px" autocomplete="new-password">
+    <div class="modal-actions">
+      <button class="btn ghost" data-close>取消</button>
+      <button class="btn primary" id="savePassBtn">更新密碼</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-back" id="settingsModal">
   <div class="modal">
     <h3>管理員工具</h3>
@@ -475,10 +489,12 @@
       <button class="btn ghost" id="importBtn" style="flex:1">⬆︎ 匯入備份</button>
     </div>
     <div class="modal-actions" style="flex-wrap:wrap">
+      <button class="btn ghost" id="changePassBtn" style="flex:1">🔑 更改管理密碼</button>
       <button class="btn ghost" id="resetPassBtn" style="flex:1">🔒 退出管理員</button>
     </div>
     <input type="file" id="importFile" accept="application/json" hidden>
-    <p class="hint" style="margin:14px 0 0;font-size:12px" id="storeInfo"></p>
+    <p class="hint" style="margin:14px 0 0;font-size:12px" id="authInfo"></p>
+    <p class="hint" style="margin:4px 0 0;font-size:12px" id="storeInfo"></p>
   </div>
 </div>
 
@@ -493,8 +509,10 @@ const CONFIG = {
   APP_TITLE: '討論牆',
   // 免費雲端儲存（kvdb.io bucket）。想換成自己的永久儲存，見 README。
   KVDB_BUCKET: '14pPD4kXQMCcoRxm3vt9Cx',
-  // 管理員密碼：可自行改成任何文字（改完記得重新部署）
+  // 管理員「初始」密碼。管理員可在網頁內自行改密碼（會存到雲端，所有裝置生效）。
   ADMIN_PASS: 'teach2026',
+  // 忘記密碼時：把 ADMIN_PASS 改成新密碼，並把 AUTH_EPOCH +1，重新部署即可覆寫雲端密碼。
+  AUTH_EPOCH: 1,
   POLL_MS: 12000,
   DEFAULT_TOPICS: [
     { id: 'b1', name: '本週討論', desc: '主持人可以在這裡提出題目，參加者撳入去就可以貼上自己嘅答案。', color: 'lilac' },
@@ -641,6 +659,7 @@ if (!S.name) {
 const PREFIX = (tid) => 'p:' + tid + ':';
 const K_TOPICS = 'cfg:topics';
 const K_LEGACY = 'cfg:boards';
+const K_AUTH = 'cfg:auth';
 
 async function mapLimit(arr, limit, fn) {
   const out = new Array(arr.length);
@@ -666,6 +685,53 @@ function applyTheme(t) {
   localStorage.setItem('pwall:theme', t);
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) meta.setAttribute('content', t === 'dark' ? '#131217' : '#F6F6FB');
+}
+
+/* ---------------- admin password ---------------- */
+function hasSubtle() {
+  return !!(window.crypto && window.crypto.subtle && window.crypto.subtle.digest);
+}
+
+/* alg: 不指定＝自動選擇；指定 'sha256' 但環境不支援時回傳 null */
+async function hashPass(pw, salt, alg) {
+  const wantSha = alg ? alg === 'sha256' : hasSubtle();
+  if (wantSha) {
+    if (!hasSubtle()) return null;
+    const data = new TextEncoder().encode(salt + ':' + pw);
+    const buf = await crypto.subtle.digest('SHA-256', data);
+    return { alg: 'sha256', hash: Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('') };
+  }
+  // 非 https 環境（例如直接開檔案）的備援雜湊，只作防呆用
+  const data = new TextEncoder().encode(salt + ':' + pw);
+  let h1 = 0x811c9dc5 >>> 0;
+  for (let i = 0; i < data.length; i++) h1 = Math.imul(h1 ^ data[i], 16777619) >>> 0;
+  return { alg: 'fnv1a', hash: 'fb' + h1.toString(16) };
+}
+
+async function getAuthRecord() {
+  try {
+    const a = await S.store.get(K_AUTH);
+    if (a && a.hash && a.epoch === CONFIG.AUTH_EPOCH) return a;
+  } catch (e) {}
+  return null;
+}
+
+async function checkPass(pw) {
+  const a = await getAuthRecord();
+  if (!a) return pw === CONFIG.ADMIN_PASS;
+  const r = await hashPass(pw, a.salt, a.alg || 'fnv1a');
+  if (!r) { toast('此瀏覽器無法驗證密碼，請用 https 開啟本頁', 'err'); return false; }
+  return r.hash === a.hash;
+}
+
+async function authInfoText() {
+  try {
+    const a = await getAuthRecord();
+    if (!a) return '密碼來源：預設（' + CONFIG.ADMIN_PASS + '）';
+    const d = new Date(a.updatedAt || 0);
+    const pad = (n) => String(n).padStart(2, '0');
+    return '密碼來源：自訂（' + d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' 更新）';
+  } catch (e) { return ''; }
 }
 
 /* ---------------- topics ---------------- */
@@ -1066,21 +1132,37 @@ function bindEvents() {
 
   /* admin */
   $('#adminBtn').addEventListener('click', () => {
-    if (S.admin) openModal('settingsModal');
+    if (S.admin) { openModal('settingsModal'); refreshAuthInfo(); }
     else { $('#passInput').value = ''; openModal('adminModal'); setTimeout(() => $('#passInput').focus(), 60); }
   });
-  $('#passOk').addEventListener('click', () => {
-    if ($('#passInput').value === CONFIG.ADMIN_PASS) {
-      S.admin = true;
-      localStorage.setItem('pwall:admin', '1');
-      document.body.classList.add('is-admin');
-      closeModal('adminModal');
-      renderHome(true);
-      toast('已進入管理員模式', 'ok');
-      openModal('settingsModal');
-    } else { toast('密碼不正確', 'err'); }
+  $('#passOk').addEventListener('click', async () => {
+    const btn = $('#passOk');
+    btn.disabled = true;
+    try {
+      if (await checkPass($('#passInput').value)) {
+        S.admin = true;
+        localStorage.setItem('pwall:admin', '1');
+        document.body.classList.add('is-admin');
+        closeModal('adminModal');
+        renderHome(true);
+        toast('已進入管理員模式', 'ok');
+        openModal('settingsModal');
+        refreshAuthInfo();
+      } else { toast('密碼不正確', 'err'); }
+    } finally { btn.disabled = false; }
   });
   $('#passInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#passOk').click(); });
+  $('#changePassBtn').addEventListener('click', () => {
+    $('#curPass').value = ''; $('#newPass').value = ''; $('#newPass2').value = '';
+    closeModal('settingsModal');
+    openModal('passChangeModal');
+    setTimeout(() => $('#curPass').focus(), 60);
+  });
+  $('#savePassBtn').addEventListener('click', saveNewPass);
+  ['curPass', 'newPass', 'newPass2'].forEach((id) => {
+    $('#' + id).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); saveNewPass(); } });
+  });
+
   $('#resetPassBtn').addEventListener('click', () => {
     S.admin = false;
     localStorage.removeItem('pwall:admin');
@@ -1241,6 +1323,34 @@ async function shareUrl(url) {
   } catch (e) {
     try { window.prompt('複製這條連結分享出去：', url); } catch (e2) {}
   }
+}
+
+/* ---------------- change password ---------------- */
+async function refreshAuthInfo() {
+  const el = $('#authInfo');
+  if (el) el.textContent = await authInfoText();
+}
+
+async function saveNewPass() {
+  const cur = $('#curPass').value;
+  const n1 = $('#newPass').value;
+  const n2 = $('#newPass2').value;
+  const btn = $('#savePassBtn');
+  if (!cur) { toast('請輸入目前密碼', 'err'); return; }
+  if (n1.length < 4) { toast('新密碼最少 4 個字元', 'err'); return; }
+  if (n1 !== n2) { toast('兩次輸入的新密碼唔一致', 'err'); return; }
+  btn.disabled = true;
+  try {
+    if (!(await checkPass(cur))) { toast('目前密碼不正確', 'err'); return; }
+    const salt = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+    const r = await hashPass(n1, salt);
+    await S.store.put(K_AUTH, { v: 1, salt: salt, alg: r.alg, hash: r.hash, epoch: CONFIG.AUTH_EPOCH, updatedAt: Date.now() });
+    closeModal('passChangeModal');
+    toast('密碼已更新，所有裝置即時生效', 'ok');
+    refreshAuthInfo();
+  } catch (e) {
+    toast('儲存失敗，請重試', 'err');
+  } finally { btn.disabled = false; }
 }
 
 /* ---------------- init ---------------- */
